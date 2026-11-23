@@ -103,6 +103,57 @@ class KnowledgeBaseApiTests(unittest.TestCase):
         for query in ({'q': 'документ-якого-немає'}, {'q': 'ПРИНТЕР', 'category': 'Мережі'}):
             self.assertEqual(self.http('GET', '/api/articles?' + urlencode(query), cookie=reader)[1], [])
 
+    def test_diagnostics_model_matching_and_server_permissions(self):
+        reader = self.login('reader')
+        editor = self.login('editor')
+        issue = {'device': 'printer', 'model': 'PR-80', 'symptom': 'Принтер не друкує'}
+        self.assertEqual(self.http('POST', '/api/diagnose', issue)[0], 401)
+        self.assertEqual(self.http('POST', '/api/diagnose', {**issue, 'device': []}, reader)[0], 400)
+        self.assertEqual(self.http('POST', '/api/diagnose', {**issue, 'symptom': ' '}, reader)[0], 400)
+        article = {'title': 'Перевірка PR-80', 'body': 'Перевір папір. Виконай пробний друк.',
+                   'category': 'Обладнання', 'device': 'printer', 'model': 'PR-80, PR-81',
+                   'symptoms': 'не друкує, немає паперу'}
+        self.assertEqual(self.http('POST', '/api/articles', article, reader)[0], 403)
+        status, saved, _ = self.http('POST', '/api/articles', article, editor)
+        self.assertEqual(status, 201)
+        diagnose = lambda data: self.http('POST', '/api/diagnose', data, reader)[1]['matches']
+        matches = diagnose(issue)
+        self.assertEqual(matches[0]['id'], saved['id'])
+        self.assertTrue(matches[0]['modelMatched'])
+        self.assertTrue(any('Модель збігається' in reason for reason in matches[0]['reasons']))
+        for model in ('', 'PR-99'):
+            self.assertNotIn(saved['id'], [row['id'] for row in diagnose({**issue, 'model': model})])
+        self.assertEqual(diagnose({**issue, 'symptom': 'зебра-невідома-помилка'}), [])
+        self.assertNotIn(saved['id'], [row['id'] for row in diagnose({**issue, 'device': 'network'})])
+        path = f"/api/articles/{saved['id']}"
+        # Earlier clients can edit the text without sending the new applicability fields.
+        change = {key: saved[key] for key in ('title', 'category', 'keywords', 'body', 'version')}
+        revised = self.http('PATCH', path, change, editor)[1]
+        self.assertEqual(revised['model'], 'PR-80, PR-81')
+        revised['model'] = 'PR-90'
+        self.assertEqual(self.http('PATCH', path, revised, editor)[0], 200)
+        versions = self.http('GET', path + '/versions', cookie=reader)[1]
+        self.assertEqual([row['model'] for row in versions], ['PR-90', 'PR-80, PR-81', 'PR-80, PR-81'])
+        self.http('PATCH', path + '/archive', {'archived': True}, editor)
+        archived_matches = self.http('POST', '/api/diagnose', {**issue, 'model': 'PR-90'}, editor)[1]['matches']
+        self.assertNotIn(saved['id'], [row['id'] for row in archived_matches])
+
+    def test_diagnostics_migration_keeps_existing_content_and_versions(self):
+        with connect(self.path) as db:
+            initial = [tuple(row) for row in db.execute('SELECT id, title, body FROM articles')]
+            for table in ('articles', 'versions'):
+                for column in ('device', 'model', 'symptoms'):
+                    db.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
+        initialize(self.path)
+        initialize(self.path)
+        with connect(self.path) as db:
+            self.assertEqual(initial, [tuple(row) for row in db.execute('SELECT id, title, body FROM articles')])
+            self.assertTrue(all(row['model'] == '' for row in db.execute('SELECT model FROM versions')))
+        reader = self.login('reader')
+        issue = {'device': 'printer', 'model': '', 'symptom': 'не друкує'}
+        matches = self.http('POST', '/api/diagnose', issue, reader)[1]['matches']
+        self.assertIn('Налаштування принтера', [row['title'] for row in matches])
+
     def test_versions_reports_archive_and_role_revocation(self):
         editor = self.login('editor')
         reader = self.login('reader')

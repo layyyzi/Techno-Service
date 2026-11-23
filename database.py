@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 
 CATEGORIES = ('Обладнання', 'Мережі', 'Програми')
+DEVICES = {'printer': 'Принтер', 'network': 'Мережа', 'workstation': 'Комп’ютер і периферія', 'software': 'Робоча програма'}
 ROLES = ('admin', 'editor', 'reader')
 DEMO_PASSWORD = 'Demo2026!'
 SCHEMA = '''
@@ -99,8 +100,8 @@ def log_event(db, kind, user_id=None):
 
 
 def save_version(db, article_id, user_id):
-    db.execute('''INSERT INTO versions (article_id, version, title, category, keywords, body, user_id)
-                  SELECT id, version, title, category, keywords, body, ? FROM articles WHERE id = ?''',
+    db.execute('''INSERT INTO versions (article_id, version, title, category, keywords, body, user_id, device, model, symptoms)
+                  SELECT id, version, title, category, keywords, body, ?, device, model, symptoms FROM articles WHERE id = ?''',
                (user_id, article_id))
 
 
@@ -110,6 +111,11 @@ def initialize(path):
         db.execute('PRAGMA journal_mode = WAL')
         db.executescript(SCHEMA)
         db.execute('BEGIN IMMEDIATE')
+        for table in ('articles', 'versions'):
+            columns = {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}
+            for field in ('device', 'model', 'symptoms'):
+                if field not in columns:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
         if db.execute('SELECT id FROM users LIMIT 1').fetchone():
             return
         for role, name in zip(ROLES, ('Адміністратор', 'Редактор', 'Читач')):

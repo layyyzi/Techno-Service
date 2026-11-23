@@ -21,10 +21,16 @@ const categoryStyles = {
   'Програми': ['program', 'program'],
 };
 const app = document.querySelector('#app');
+const publicDemo = Boolean(globalThis.TechnoDemo);
+const currentPath = () => publicDemo ? (location.hash.slice(1) || '/') : location.pathname;
+const articleHref = id => (publicDemo ? '#' : '') + '/instructions/' + id;
 const dialog = document.querySelector('#dialog');
 const notice = document.querySelector('#notice');
 let currentUser = null;
 let categories = [];
+let devices = {};
+let diagnosticDraft = {device: 'printer', model: '', symptom: ''};
+let diagnosticMatches = null;
 let page = 'articles';
 let search = '';
 let category = '';
@@ -43,7 +49,7 @@ function icon(name) {
   return '<svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' + icons[name] + '</svg>';
 }
 
-const brand = '<div class="brand"><img class="brand-mark" src="/brand.png" width="44" height="44" alt="">' +
+const brand = '<div class="brand"><img class="brand-mark" src="' + (publicDemo ? './brand.png' : '/brand.png') + '" width="44" height="44" alt="">' +
   '<div class="brand-text"><span class="brand-name">ТехноСервіс</span><span class="brand-product">База знань</span></div></div>';
 const canEdit = () => ['admin', 'editor'].includes(currentUser?.role);
 
@@ -53,6 +59,7 @@ function formatDate(value) {
 }
 
 async function request(path, method = 'GET', data = {}) {
+  if (publicDemo) return globalThis.TechnoDemo.request(path, method, data);
   const options = method === 'GET' ? {} : {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -95,7 +102,7 @@ function renderLogin() {
   app.innerHTML =
     '<main class="login"><section class="login-side">' + brand +
     '<div><h1>Корпоративна база знань</h1><p>Технічні інструкції для щоденної роботи з обладнанням, мережею та програмами.</p></div>' +
-    '<small>Локальна демонстрація кваліфікаційної роботи</small></section>' +
+    '<small>' + (publicDemo ? 'Публічне демо · зміни зберігаються у твоєму браузері' : 'Локальна демонстрація кваліфікаційної роботи') + '</small></section>' +
     '<section class="login-main"><div class="login-card"><h2>Вхід до бази знань</h2>' +
     '<p class="muted">Увійди під обліковим записом працівника.</p>' +
     '<form class="fields" id="login-form"><label class="field">Електронна пошта<input name="email" type="email" autocomplete="username" placeholder="editor@demo.test" maxlength="254" required></label>' +
@@ -122,6 +129,7 @@ function renderLogin() {
 function setSession(session) {
   currentUser = session.user;
   categories = session.categories;
+  devices = session.devices || {};
 }
 
 function bindForm(form, onSubmit) {
@@ -149,22 +157,26 @@ function navButton(target, label, symbol) {
 function renderShell(label, contents, options = {}) {
   app.innerHTML = '<div class="shell"><aside class="sidebar">' + brand +
     '<nav aria-label="Розділи бази знань">' + navButton('articles', 'Інструкції', 'book') +
+    navButton('diagnostics', 'Підібрати рішення', 'search') +
     (canEdit() ? navButton('archive', 'Архів', 'archive') + navButton('reports', 'Неточності', 'flag') : '') +
     (currentUser.role === 'admin' ? navButton('users', 'Користувачі', 'users') : '') +
-    '</nav><div class="sidebar-account"><span class="avatar" aria-hidden="true">' + escapeText(currentUser.name[0]) + '</span>' +
+    '</nav>' + (publicDemo ? '<small class="muted">Публічне демо<br>Зміни зберігаються у твоєму браузері.</small>' : '') +
+    '<div class="sidebar-account"><span class="avatar" aria-hidden="true">' + escapeText(currentUser.name[0]) + '</span>' +
     '<span class="account-text"><strong>' + escapeText(currentUser.name) + '</strong><small>' + roles[currentUser.role] + '</small></span>' +
     '<button class="button subtle icon-button" id="logout" type="button" aria-label="Вийти" title="Вийти">' + icon('logout') + '</button></div></aside>' +
     '<div class="workspace"><header class="topbar"><div class="breadcrumbs"><span>База знань</span><span aria-hidden="true">/</span><span>' + label + '</span></div>' +
     (options.create ? '<button class="button primary" id="create" type="button">' + icon('plus') + 'Створити інструкцію</button>' : '') +
     '</header><main class="content" id="content">' + contents + '</main></div></div>';
   app.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => {
-    if (location.pathname !== '/' || page !== button.dataset.page) openPage(button.dataset.page);
+    if (currentPath() !== '/' || page !== button.dataset.page) openPage(button.dataset.page);
   }));
   app.querySelector('#logout').addEventListener('click', async () => {
     try {
       await request('/logout', 'POST');
       currentUser = null;
-      history.replaceState({}, '', '/');
+      diagnosticDraft = {device: 'printer', model: '', symptom: ''};
+      diagnosticMatches = null;
+      history.replaceState({}, '', publicDemo ? '#/' : '/');
       renderLogin();
     } catch (error) {
       notify(error.message);
@@ -174,8 +186,8 @@ function renderShell(label, contents, options = {}) {
 }
 
 function go(path, state = {}) {
-  if (location.pathname !== path || history.state?.section !== state.section) {
-    history.pushState(state, '', path);
+  if (currentPath() !== path || history.state?.section !== state.section) {
+    history.pushState(state, '', publicDemo ? '#' + path : path);
   }
   renderLocation();
 }
@@ -192,13 +204,14 @@ async function renderLocation() {
   const id = ++renderId;
   clearTimeout(searchTimer);
   if (!currentUser) return;
-  const match = /^\/instructions\/(\d+)$/.exec(location.pathname);
+  const match = /^\/instructions\/(\d+)$/.exec(currentPath());
   if (match) {
     await renderDetail(match[1], id);
     return;
   }
   const target = history.state?.section;
-  if (target === 'reports' && canEdit()) await renderReports(id);
+  if (target === 'diagnostics') renderDiagnostics();
+  else if (target === 'reports' && canEdit()) await renderReports(id);
   else if (target === 'users' && currentUser.role === 'admin') await renderUsers(id);
   else renderLibrary(target === 'archive' && canEdit());
 }
@@ -254,10 +267,117 @@ async function updateList(archived) {
 
 function renderCard(article) {
   const [symbol, tone] = categoryStyles[article.category] || ['file', ''];
-  return '<a class="article-card" data-article href="/instructions/' + article.id + '">' +
+  return '<a class="article-card" data-article href="' + articleHref(article.id) + '">' +
     '<div class="card-top"><span class="tile-icon ' + tone + '">' + icon(symbol) + '</span><span class="chip">' + escapeText(article.category) + '</span></div>' +
     '<h3>' + escapeText(article.title) + '</h3><p>' + escapeText(article.excerpt) + '</p>' +
     '<div class="card-bottom">Оновлено ' + formatDate(article.updated_at) + '</div></a>';
+}
+
+function deviceOptions(selected, includeGeneral = false) {
+  return (includeGeneral ? '<option value="">Загальна інструкція</option>' : '') +
+    Object.entries(devices).map(([key, label]) =>
+      '<option value="' + key + '"' + (key === selected ? ' selected' : '') + '>' + escapeText(label) + '</option>').join('');
+}
+
+function renderDiagnostics() {
+  page = 'diagnostics';
+  renderShell('Підібрати рішення',
+    '<header class="section-head"><h1 class="section-title">Що сталося з обладнанням?</h1>' +
+    '<p class="muted">Вкажи пристрій і симптом. Знайдені інструкції можна перевірити перед виконанням кроків.</p></header>' +
+    '<div class="diagnostic-layout"><form class="panel fields" id="diagnostic-form">' +
+    '<label class="field">Тип обладнання<select name="device">' + deviceOptions(diagnosticDraft.device) + '</select></label>' +
+    '<label class="field">Модель (якщо відома)<input name="model" maxlength="160" value="' + escapeText(diagnosticDraft.model) + '" placeholder="Модель із наліпки на корпусі"></label>' +
+    '<label class="field">Що не працює?<textarea name="symptom" rows="4" required maxlength="1000" placeholder="Наприклад, принтер не друкує після встановлення драйвера">' +
+    escapeText(diagnosticDraft.symptom) + '</textarea></label>' +
+    '<p class="error" role="alert" hidden></p><button class="button primary" type="submit">Знайти відповідні інструкції</button>' +
+    '</form><section id="diagnostic-results" class="diagnostic-results" aria-live="polite"></section></div>');
+  const form = app.querySelector('#diagnostic-form');
+  const results = app.querySelector('#diagnostic-results');
+  const updateDraft = () => {
+    diagnosticDraft = Object.fromEntries(new FormData(form));
+    diagnosticMatches = null;
+    results.innerHTML = '<p class="empty">Натисни «Знайти відповідні інструкції», щоб перевірити новий опис.</p>';
+  };
+  form.addEventListener('input', updateDraft);
+  form.addEventListener('change', updateDraft);
+  bindForm(form, async data => {
+    diagnosticDraft = data;
+    const submitted = JSON.stringify(data);
+    const response = await request('/diagnose', 'POST', data);
+    if (!form.isConnected || JSON.stringify(diagnosticDraft) !== submitted) return;
+    diagnosticMatches = response.matches;
+    showDiagnosticResults(results);
+  });
+  showDiagnosticResults(results);
+  if (diagnosticMatches !== null) form.requestSubmit();
+}
+
+function showDiagnosticResults(element) {
+  if (diagnosticMatches === null) {
+    element.innerHTML = '<div class="panel diagnostic-intro"><h2>Знайди інструкцію для свого випадку</h2>' +
+      '<p>Модель допомагає відсіяти матеріали для іншого обладнання. В описі вкажи дію або текст повідомлення, наприклад «не друкує» чи «відмовлено в доступі».</p></div>';
+    return;
+  }
+  element.innerHTML = '<h2>' + (diagnosticMatches.length ? 'Матеріали для перевірки' : 'Відповідної інструкції поки немає') + '</h2>' +
+    (diagnosticMatches.length ? '<div class="diagnostic-list">' + diagnosticMatches.map(article =>
+      '<article class="panel diagnostic-match"><div class="row"><span class="chip">' + escapeText(article.category) + '</span>' +
+      '<span class="chip">Версія ' + article.version + '</span></div><h3><a data-article data-diagnosis href="' + articleHref(article.id) + '">' +
+      escapeText(article.title) + '</a></h3><p>' + escapeText(article.excerpt) + '</p><ul class="match-reasons">' +
+      article.reasons.map(reason => '<li>' + escapeText(reason) + '</li>').join('') +
+      '</ul><small class="muted">Оновлено ' + formatDate(article.updated_at) + '</small></article>').join('') + '</div>' :
+      '<p class="muted">Уточни модель або опиши симптом іншими словами. Для підтримки можна підготувати звернення з усіма спостереженнями.</p>') +
+    '<section class="panel handoff"><h3>Потрібна допомога підтримки?</h3><p>Додай серійний номер і виконані перевірки, щоб підготувати текст звернення.</p>' +
+    '<button class="button" id="prepare-support" type="button">Підготувати звернення</button></section>';
+  element.querySelector('#prepare-support').addEventListener('click', supportForm);
+}
+
+function supportForm() {
+  const context = {...diagnosticDraft};
+  modalForm('Звернення до техпідтримки',
+    '<label class="field">Серійний номер<input name="serial" maxlength="160" required placeholder="S/N на корпусі пристрою"></label>' +
+    '<label class="check-field"><input name="noSerial" type="checkbox"> На пристрої немає серійного номера</label>' +
+    '<label class="field" id="serial-explanation" hidden>Пояснення (за бажанням)<input name="reason" maxlength="500" disabled></label>' +
+    '<label class="field">Що вже перевірено?<textarea name="checked" maxlength="2000" rows="3" placeholder="Наприклад, живлення підключене, пробний друк не виконується"></textarea></label>',
+    'Сформувати текст', async data => {
+      if (!data.noSerial && !data.serial?.trim()) throw new Error('Вкажи серійний номер або познач його відсутність.');
+      const identity = data.noSerial ? 'На пристрої немає серійного номера' : data.serial.trim();
+      const text = [
+        'Звернення до техпідтримки',
+        'Обладнання — ' + devices[context.device],
+        'Модель — ' + (context.model.trim() || 'Не вказана'),
+        'Серійний номер — ' + identity,
+        ...(data.noSerial && data.reason?.trim() ? ['Пояснення — ' + data.reason.trim()] : []),
+        '', 'Опис проблеми', context.symptom.trim(),
+        '', 'Виконані перевірки', data.checked.trim() || 'Не вказані',
+      ].join('\n');
+      openDialog('Текст звернення готовий',
+        '<p class="muted">Скопіюй текст у свою систему заявок або завантаж його файлом.</p>' +
+        '<label class="field">Текст звернення<textarea id="support-text" readonly rows="12"></textarea></label>' +
+        '<div class="row dialog-actions"><button class="button" id="download-support" type="button">Завантажити .txt</button>' +
+        '<button class="button primary" id="copy-support" type="button">Скопіювати текст</button></div>');
+      dialog.querySelector('#support-text').value = text;
+      dialog.querySelector('#download-support').addEventListener('click', () => {
+        const url = URL.createObjectURL(new Blob([text], {type: 'text/plain;charset=utf-8'}));
+        const link = document.createElement('a');
+        link.href = url; link.download = 'techno-service-request.txt'; link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+      dialog.querySelector('#copy-support').addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(text); notify('Текст звернення скопійовано'); }
+        catch {
+          dialog.querySelector('#support-text').select();
+          notify('Натисни Ctrl+C, щоб скопіювати виділений текст.');
+        }
+      });
+    });
+  const form = dialog.querySelector('form');
+  form.elements.noSerial.addEventListener('change', event => {
+    const missing = event.target.checked;
+    form.elements.serial.required = !missing;
+    form.elements.serial.disabled = missing;
+    form.elements.reason.disabled = !missing;
+    form.querySelector('#serial-explanation').hidden = !missing;
+  });
 }
 
 async function renderDetail(articleId, id) {
@@ -271,13 +391,21 @@ async function renderDetail(articleId, id) {
       '<div class="row"><span class="chip">' + escapeText(article.category) + '</span><span class="chip">Версія ' + article.version + '</span>' +
       (article.archived ? '<span class="chip">В архіві</span>' : '') + '</div><h1>' + escapeText(article.title) + '</h1>' +
       '<p class="muted">Оновлено ' + formatDate(article.updated_at) + ' · ' + escapeText(article.author) + '</p></header>' +
+      ((article.device || article.model || article.symptoms) ? '<dl class="panel applicability"><div><dt>Обладнання</dt><dd>' +
+      escapeText(devices[article.device] || 'Загальна інструкція') + '</dd></div><div><dt>Моделі</dt><dd>' +
+      escapeText(article.model || 'Загальні дії для цього типу') + '</dd></div>' +
+      (article.symptoms ? '<div><dt>Симптоми</dt><dd>' + escapeText(article.symptoms) + '</dd></div>' : '') + '</dl>' : '') +
       '<div class="panel article-body">' + escapeText(article.body) + '</div><div class="row detail-actions">' +
       '<button class="button" data-action="history">' + icon('history') + 'Історія версій</button>' +
       (!article.archived ? '<button class="button" data-action="report">' + icon('flag') + 'Повідомити про неточність</button>' : '') +
       (canEdit() && !article.archived ? '<button class="button" data-action="edit">' + icon('edit') + 'Редагувати</button>' : '') +
       (canEdit() ? '<button class="button" data-action="archive">' + icon('archive') + (article.archived ? 'Повернути з архіву' : 'Архівувати') + '</button>' : '') +
       '</div></article>';
-    content.querySelector('#back').addEventListener('click', () => openPage(article.archived ? 'archive' : 'articles', true));
+    const fromDiagnosis = history.state?.fromDiagnosis;
+    const backTarget = fromDiagnosis ? 'diagnostics' : (article.archived ? 'archive' : 'articles');
+    const back = content.querySelector('#back');
+    if (fromDiagnosis) back.textContent = 'Повернутися до підбору';
+    back.addEventListener('click', () => openPage(backTarget, true));
     content.querySelector('[data-action=edit]')?.addEventListener('click', () => articleForm(article));
     content.querySelector('[data-action=report]')?.addEventListener('click', () => reportForm(article));
     content.querySelector('[data-action=history]').addEventListener('click', () => showVersions(article.id));
@@ -312,7 +440,12 @@ function articleForm(article = {}) {
     '<label class="field">Категорія<select name="category">' + categories.map(value =>
       '<option' + (article.category === value ? ' selected' : '') + '>' + escapeText(value) + '</option>').join('') + '</select></label>' +
     '<label class="field">Ключові слова<input name="keywords" value="' + escapeText(article.keywords) + '" placeholder="Через кому" maxlength="240"></label>' +
-    '<label class="field">Текст інструкції<textarea name="body" rows="8" required maxlength="15000">' + escapeText(article.body) + '</textarea></label>',
+    '<label class="field">Текст інструкції<textarea name="body" rows="8" required maxlength="15000">' + escapeText(article.body) + '</textarea></label>' +
+    '<fieldset class="context-fields"><legend>Для підбору за проблемою</legend><div class="fields">' +
+    '<label class="field">Тип обладнання<select name="device">' + deviceOptions(article.device, true) + '</select></label>' +
+    '<label class="field">Моделі (через кому, за потреби)<input name="model" maxlength="160" value="' + escapeText(article.model) + '" placeholder="Порожнє поле — загальні дії для цього типу"></label>' +
+    '<label class="field">Симптоми й тексти помилок<textarea name="symptoms" maxlength="500" rows="3" placeholder="Наприклад, немає паперу, помилка друку">' +
+    escapeText(article.symptoms) + '</textarea></label></div></fieldset>',
     'Зберегти', async data => {
       if (updating) data.version = article.version;
       const saved = await request(updating ? '/articles/' + article.id : '/articles', updating ? 'PATCH' : 'POST', data);
@@ -358,7 +491,10 @@ async function showVersions(articleId) {
     if (!loading.isConnected || !dialog.open) return;
     loading.outerHTML = '<div>' + versions.map(version => '<details class="version"><summary>Версія ' +
       version.version + ' · ' + formatDate(version.created_at) + ' · ' + escapeText(version.name) + '</summary>' +
-      '<div class="article-body"><strong>' + escapeText(version.title) + '</strong><p>' + escapeText(version.body) + '</p></div></details>').join('') + '</div>';
+      '<div class="article-body"><strong>' + escapeText(version.title) + '</strong><p>' + escapeText(version.body) + '</p>' +
+      '<p class="muted">' + escapeText(devices[version.device] || 'Загальна інструкція') +
+      (version.model ? ' · Моделі — ' + escapeText(version.model) : '') +
+      (version.symptoms ? '\nСимптоми — ' + escapeText(version.symptoms) : '') + '</p></div></details>').join('') + '</div>';
   } catch (error) {
     if (loading.isConnected) errorBox(loading, error);
   }
@@ -371,7 +507,7 @@ async function renderReports(id) {
   try {
     const items = await request('/reports');
     if (id !== renderId) return;
-    rows.innerHTML = items.length ? items.map(item => '<section class="panel list-item"><div class="stack"><a data-article href="/instructions/' + item.article_id + '">' +
+    rows.innerHTML = items.length ? items.map(item => '<section class="panel list-item"><div class="stack"><a data-article href="' + articleHref(item.article_id) + '">' +
       escapeText(item.title) + '</a><p class="article-body">' + escapeText(item.message) + '</p><small>' + escapeText(item.name) + ' · ' + formatDate(item.created_at) +
       '</small></div>' + (item.resolved ? '<span class="chip">Опрацьовано</span>' :
         '<button class="button" data-resolve="' + item.id + '">Позначити опрацьованим</button>') + '</section>').join('') :
@@ -424,7 +560,7 @@ app.addEventListener('click', event => {
   const link = event.target.closest('a[data-article]');
   if (link && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
     event.preventDefault();
-    go(link.pathname);
+    go(publicDemo ? link.hash.slice(1) : link.pathname, {fromDiagnosis: link.hasAttribute('data-diagnosis')});
   }
 });
 window.addEventListener('popstate', () => {

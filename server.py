@@ -12,7 +12,8 @@ from pathlib import Path
 from threading import Thread
 from urllib.parse import parse_qs, urlsplit
 
-from database import CATEGORIES, ROLES, connect, initialize, log_event, save_version, verify_password
+from database import CATEGORIES, DEVICES, ROLES, connect, initialize, log_event, save_version, verify_password
+from diagnostics import recommend
 
 
 ROOT = Path(__file__).resolve().parent
@@ -20,7 +21,7 @@ SESSION_SECONDS = 8 * 3600
 COOKIE = 'knowledge_session'
 STATIC = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'text/javascript'),
           '/style.css': ('style.css', 'text/css'), '/brand.png': ('brand.png', 'image/png')}
-ARTICLE_FIELDS = '''a.id, a.title, a.category, a.keywords, a.body, a.version, a.archived,
+ARTICLE_FIELDS = '''a.id, a.title, a.category, a.keywords, a.body, a.device, a.model, a.symptoms, a.version, a.archived,
                     a.updated_at, u.name AS author FROM articles a JOIN users u ON u.id = a.author_id'''
 
 
@@ -140,7 +141,15 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('DELETE FROM sessions WHERE token_hash = ?', (token_hash(session),))
             return 200, {'ok': True}, session_cookie('', 0)
         if path == '/api/session' and method == 'GET':
-            return 200, {'user': dict(user), 'categories': CATEGORIES}, None
+            return 200, {'user': dict(user), 'categories': CATEGORIES, 'devices': DEVICES}, None
+        if path == '/api/diagnose' and method == 'POST':
+            device = data.get('device')
+            if not isinstance(device, str) or device not in DEVICES:
+                raise ApiError(400, 'Обери тип обладнання.')
+            model = required_text(data, 'model', 'Модель', 160, optional=True)
+            symptom = required_text(data, 'symptom', 'Опис проблеми', 1000)
+            articles = db.execute(f'SELECT {ARTICLE_FIELDS} WHERE a.archived = 0').fetchall()
+            return 200, {'matches': recommend([dict(row) for row in articles], device, model, symptom)}, None
         if path == '/api/articles':
             if method == 'GET':
                 archived = query.get('archived', ['0'])[0] == '1'
@@ -150,8 +159,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == 'POST':
                 self.require_editor(can_edit)
                 fields = self.article_fields(data)
-                row = db.execute('''INSERT INTO articles (title, category, keywords, body, author_id)
-                                    VALUES (?, ?, ?, ?, ?)''', (*fields, user['id']))
+                row = db.execute('''INSERT INTO articles (title, category, keywords, body, device, model, symptoms, author_id)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (*fields, user['id']))
                 save_version(db, row.lastrowid, user['id'])
                 return 201, self.get_article(db, row.lastrowid, can_edit), None
 
@@ -203,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
         db.execute('INSERT INTO sessions VALUES (?, ?, ?)', (token_hash(token), user['id'], now + SESSION_SECONDS))
         log_event(db, 'login_ok', user['id'])
         public_user = {key: user[key] for key in ('id', 'email', 'name', 'role')}
-        return 200, {'user': public_user, 'categories': CATEGORIES}, session_cookie(token, SESSION_SECONDS)
+        return 200, {'user': public_user, 'categories': CATEGORIES, 'devices': DEVICES}, session_cookie(token, SESSION_SECONDS)
 
     @staticmethod
     def require_editor(can_edit):
@@ -233,14 +242,21 @@ class Handler(BaseHTTPRequestHandler):
         return result
 
     @staticmethod
-    def article_fields(data):
+    def article_fields(data, previous=None):
         title = required_text(data, 'title', 'Назва', 140)
         body = required_text(data, 'body', 'Текст інструкції', 15_000)
         category = data.get('category') or CATEGORIES[0]
         if category not in CATEGORIES:
             raise ApiError(400, 'Обери категорію зі списку.')
         keywords = required_text(data, 'keywords', 'Ключові слова', 240, optional=True)
-        return title, category, keywords, body
+        previous = previous or {}
+        device = data.get('device', previous.get('device', ''))
+        if not isinstance(device, str) or (device and device not in DEVICES):
+            raise ApiError(400, 'Обери тип обладнання зі списку.')
+        context = {key: data.get(key, previous.get(key, '')) for key in ('model', 'symptoms')}
+        model = required_text(context, 'model', 'Моделі обладнання', 160, optional=True)
+        symptoms = required_text(context, 'symptoms', 'Симптоми', 500, optional=True)
+        return title, category, keywords, body, device, model, symptoms
 
     def article_action(self, db, article_id, action, article, user, can_edit, data):
         method = self.command
@@ -252,14 +268,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(409, 'Спочатку поверни інструкцію з архіву.')
             if type(data.get('version')) is not int or data['version'] != article['version']:
                 raise ApiError(409, 'Інструкцію вже оновлено. Відкрий її знову перед редагуванням.')
-            fields = self.article_fields(data)
-            db.execute('''UPDATE articles SET title = ?, category = ?, keywords = ?, body = ?,
+            fields = self.article_fields(data, article)
+            db.execute('''UPDATE articles SET title = ?, category = ?, keywords = ?, body = ?, device = ?, model = ?, symptoms = ?,
                           version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?''',
                        (*fields, article_id))
             save_version(db, article_id, user['id'])
             return 200, self.get_article(db, article_id, can_edit), None
         if action == 'versions' and method == 'GET':
-            rows = db.execute('''SELECT v.version, v.title, v.category, v.keywords, v.body, v.created_at, u.name
+            rows = db.execute('''SELECT v.version, v.title, v.category, v.keywords, v.body, v.device, v.model, v.symptoms, v.created_at, u.name
                                  FROM versions v JOIN users u ON v.user_id = u.id
                                  WHERE v.article_id = ? ORDER BY v.version DESC''', (article_id,))
             return 200, [dict(row) for row in rows], None

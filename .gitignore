@@ -1,4 +1,6 @@
 __pycache__/
+.runtime/
+dist/
 data/
 *.sqlite3
 *.sqlite3-shm

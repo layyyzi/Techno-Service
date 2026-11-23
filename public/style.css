@@ -130,8 +130,25 @@ dialog::backdrop { background: #14244680; }
 .version summary { cursor: pointer; color: var(--blue); font-weight: 650; }
 .version .article-body { margin: 10px 0; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.diagnostic-layout { display: grid; grid-template-columns: minmax(260px, 360px) minmax(0, 1fr); gap: 24px; align-items: start; }
+.diagnostic-layout > form { position: sticky; top: 20px; }
+.diagnostic-results, .diagnostic-list { display: grid; gap: 14px; min-width: 0; }
+.diagnostic-results h2 { font-size: 1.3rem; letter-spacing: -.03em; }
+.diagnostic-match { display: grid; gap: 12px; overflow-wrap: anywhere; }
+.diagnostic-match p, .diagnostic-intro p, .handoff p { line-height: 1.6; color: var(--muted); }
+.diagnostic-intro, .handoff { display: grid; gap: 12px; }
+.handoff .button { justify-self: start; }
+.match-reasons { margin: 0; padding-left: 20px; line-height: 1.7; font-size: .88rem; color: #345383; }
+.context-fields { margin: 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; }
+.context-fields legend { padding: 0 7px; font-weight: 650; }
+.check-field { display: flex; align-items: center; gap: 9px; font-size: .9rem; }
+.check-field input { width: 18px; height: 18px; flex: none; }
+.applicability { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin: 0 0 16px; }
+.applicability dt { color: var(--muted); font-size: .83rem; }
+.applicability dd { margin: 5px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 1050px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } .hero-art { right: 5%; } }
 @media (max-width: 800px) { .hero-art { display: none; } .shell { grid-template-columns: 186px minmax(0, 1fr); } .sidebar { padding-inline: 11px; } }
+@media (max-width: 960px) { .diagnostic-layout { grid-template-columns: minmax(0, 1fr); } .diagnostic-layout > form { position: static; } }
 @media (max-width: 680px) {
   .login { grid-template-columns: 1fr; }
   .login-side { min-height: auto; gap: 28px; }
