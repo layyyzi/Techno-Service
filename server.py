@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -50,8 +51,22 @@ def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def session_cookie(token, max_age):
-    return f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}'
+def session_cookie(token, max_age, secure=False):
+    value = f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}'
+    return value + ('; Secure' if secure else '')
+
+
+def https_origin(value):
+    if not value:
+        return ''
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.path not in ('', '/')
+            or parsed.query or parsed.fragment
+            or not re.fullmatch(r'[a-zA-Z0-9.-]+', parsed.hostname)):
+        raise ValueError('TECHNO_PUBLIC_URL must be an HTTPS origin, e.g. https://kb.example.com')
+    port = parsed.port
+    return 'https://' + parsed.hostname + (f':{port}' if port not in (None, 443) else '')
 
 
 def csrf_token(token):
@@ -93,6 +108,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if self.server.public_origin:
+            self.send_header('Strict-Transport-Security', 'max-age=31536000')
         if status == 429:
             self.send_header('Retry-After', str(self.server.login_limiter.window))
         if cookie:
@@ -131,7 +148,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, 'Ця адреса недоступна.')
             if self.command in ('POST', 'PATCH'):
                 origin = self.headers.get('Origin')
-                if origin and origin != f'http://{host}':
+                expected_origin = self.server.public_origin or f'http://{host}'
+                if (self.server.public_origin and origin != expected_origin) or (origin and origin != expected_origin):
                     raise ApiError(403, 'Запит з іншого сайту відхилено.')
                 if self.headers.get('X-Techno-Request') != '1':
                     raise ApiError(403, 'Запит не пройшов перевірку безпеки.')
@@ -163,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, db, path, query, data):
         method = self.command
         session = self.session_token()
+        if path == '/api/config' and method == 'GET':
+            return 200, {'demoAccounts': not bool(self.server.public_origin)}, None
         if path == '/api/login' and method == 'POST':
             return self.login(db, data, session)
 
@@ -179,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == '/api/logout' and method == 'POST':
             db.execute('DELETE FROM sessions WHERE token_hash = ?', (token_hash(session),))
-            return 200, {'ok': True}, session_cookie('', 0)
+            return 200, {'ok': True}, session_cookie('', 0, bool(self.server.public_origin))
         if path == '/api/session' and method == 'GET':
             return 200, {'user': dict(user), 'categories': CATEGORIES, 'devices': DEVICES,
                          'csrfToken': csrf_token(session)}, None
@@ -239,8 +259,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.change_role(db, int(user_route[1]), user, data)
         raise ApiError(404, 'Ресурс не знайдено.')
 
-    @staticmethod
-    def login(db, data, old_token):
+    def login(self, db, data, old_token):
         email = required_text(data, 'email', 'Електронна пошта', 254).lower()
         password = required_text(data, 'password', 'Пароль', 128, trim=False)
         user = db.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
@@ -254,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
         log_event(db, 'login_ok', user['id'])
         public_user = {key: user[key] for key in ('id', 'email', 'name', 'role')}
         return 200, {'user': public_user, 'categories': CATEGORIES, 'devices': DEVICES,
-                     'csrfToken': csrf_token(token)}, session_cookie(token, SESSION_SECONDS)
+                     'csrfToken': csrf_token(token)}, session_cookie(token, SESSION_SECONDS, bool(self.server.public_origin))
 
     @staticmethod
     def require_editor(can_edit):
@@ -350,23 +369,33 @@ class Handler(BaseHTTPRequestHandler):
         return 200, {'ok': True}, None
 
 
-def create_server(port, database_path):
-    initialize(database_path)
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+def create_server(port, database_path, bind='127.0.0.1', public_url='', admin_email='', admin_password=''):
+    origin = https_origin(public_url)
+    if bind not in ('127.0.0.1', '0.0.0.0'):
+        raise ValueError('TECHNO_BIND must be 127.0.0.1 or 0.0.0.0')
+    if bind != '127.0.0.1' and not origin:
+        raise ValueError('External binding requires TECHNO_PUBLIC_URL and an HTTPS reverse proxy')
+    initialize(database_path, production=bool(origin), admin_email=admin_email, admin_password=admin_password)
+    server = ThreadingHTTPServer((bind, port), Handler)
     server.database_path = database_path
     server.login_limiter = LoginLimiter()
-    server.allowed_hosts = {f'{address}:{server.server_port}' for address in ('127.0.0.1', 'localhost')}
+    server.public_origin = origin
+    server.allowed_hosts = ({urlsplit(origin).netloc} if origin else
+                            {f'{address}:{server.server_port}' for address in ('127.0.0.1', 'localhost')})
     return server
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Локальна демоверсія бази знань')
-    parser.add_argument('--port', type=int, default=8000)
-    parser.add_argument('--db', type=Path, default=ROOT / 'data' / 'knowledge.sqlite3')
+    parser = argparse.ArgumentParser(description='ТехноСервіс — база знань')
+    parser.add_argument('--port', type=int, default=os.environ.get('PORT', '8000'))
+    parser.add_argument('--db', type=Path, default=os.environ.get('TECHNO_DB', ROOT / 'data' / 'knowledge.sqlite3'))
     parser.add_argument('--open', action='store_true', help='Відкрити демо у браузері')
     args = parser.parse_args()
-    with create_server(args.port, args.db) as server:
-        url = f'http://127.0.0.1:{server.server_port}'
+    with create_server(args.port, args.db, bind=os.environ.get('TECHNO_BIND', '127.0.0.1'),
+                       public_url=os.environ.get('TECHNO_PUBLIC_URL', ''),
+                       admin_email=os.environ.get('TECHNO_ADMIN_EMAIL', ''),
+                       admin_password=os.environ.get('TECHNO_ADMIN_PASSWORD', '')) as server:
+        url = server.public_origin or f'http://127.0.0.1:{server.server_port}'
         print(f'База знань працює: {url} (Ctrl+C — зупинити)', flush=True)
         if args.open:
             Thread(target=webbrowser.open, args=(url,), daemon=True).start()
