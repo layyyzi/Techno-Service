@@ -1,15 +1,17 @@
 import argparse
 import hashlib
+import hmac
 import json
 import re
 import secrets
 import sqlite3
 import time
 import webbrowser
+from collections import deque
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from urllib.parse import parse_qs, urlsplit
 
 from database import CATEGORIES, DEVICES, ROLES, connect, initialize, log_event, save_version, verify_password
@@ -52,6 +54,33 @@ def session_cookie(token, max_age):
     return f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}'
 
 
+def csrf_token(token):
+    # Domain separation: never expose the stored session-token hash.
+    return hashlib.sha256(('csrf:' + token).encode()).hexdigest()
+
+
+class LoginLimiter:
+    """Bounded rolling window for a single server process."""
+    def __init__(self, window=60, per_address=10, total=120):
+        self.window = window
+        self.per_address = per_address
+        self.total = total
+        self.attempts = deque()
+        self.lock = Lock()
+
+    def allow(self, address):
+        now = time.monotonic()
+        with self.lock:
+            while self.attempts and self.attempts[0][0] <= now - self.window:
+                self.attempts.popleft()
+            if len(self.attempts) >= self.total:
+                return False
+            if sum(ip == address for _, ip in self.attempts) >= self.per_address:
+                return False
+            self.attempts.append((now, address))
+            return True
+
+
 class Handler(BaseHTTPRequestHandler):
     def respond(self, status, payload, content_type='application/json', cookie=None):
         if content_type == 'application/json':
@@ -64,6 +93,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if status == 429:
+            self.send_header('Retry-After', str(self.server.login_limiter.window))
         if cookie:
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
@@ -102,6 +133,8 @@ class Handler(BaseHTTPRequestHandler):
                 origin = self.headers.get('Origin')
                 if origin and origin != f'http://{host}':
                     raise ApiError(403, 'Запит з іншого сайту відхилено.')
+                if self.headers.get('X-Techno-Request') != '1':
+                    raise ApiError(403, 'Запит не пройшов перевірку безпеки.')
             if self.command == 'GET' and (path in STATIC or re.fullmatch(r'/instructions/\d+', path)):
                 file, content_type = STATIC.get(path, STATIC['/'])
                 self.respond(200, (ROOT / 'public' / file).read_bytes(), content_type)
@@ -109,6 +142,9 @@ class Handler(BaseHTTPRequestHandler):
             if not path.startswith('/api/'):
                 raise ApiError(404, 'Сторінку не знайдено.')
             data = self.request_data() if self.command in ('POST', 'PATCH') else {}
+            if path == '/api/login' and self.command == 'POST':
+                if not self.server.login_limiter.allow(self.client_address[0]):
+                    raise ApiError(429, 'Забагато спроб входу. Спробуй через хвилину.')
             with connect(self.server.database_path) as db:
                 if self.command in ('POST', 'PATCH'):
                     db.execute('BEGIN IMMEDIATE')
@@ -135,13 +171,18 @@ class Handler(BaseHTTPRequestHandler):
                           (token_hash(session), int(time.time()))).fetchone()
         if not user:
             raise ApiError(401, 'Увійди, щоб отримати доступ.')
+        if method in ('POST', 'PATCH'):
+            supplied = self.headers.get('X-CSRF-Token', '')
+            if not hmac.compare_digest(supplied.encode(), csrf_token(session).encode()):
+                raise ApiError(403, 'Недійсний захисний токен. Онови сторінку.')
         can_edit = user['role'] in ('admin', 'editor')
 
         if path == '/api/logout' and method == 'POST':
             db.execute('DELETE FROM sessions WHERE token_hash = ?', (token_hash(session),))
             return 200, {'ok': True}, session_cookie('', 0)
         if path == '/api/session' and method == 'GET':
-            return 200, {'user': dict(user), 'categories': CATEGORIES, 'devices': DEVICES}, None
+            return 200, {'user': dict(user), 'categories': CATEGORIES, 'devices': DEVICES,
+                         'csrfToken': csrf_token(session)}, None
         if path == '/api/diagnose' and method == 'POST':
             device = data.get('device')
             if not isinstance(device, str) or device not in DEVICES:
@@ -212,7 +253,8 @@ class Handler(BaseHTTPRequestHandler):
         db.execute('INSERT INTO sessions VALUES (?, ?, ?)', (token_hash(token), user['id'], now + SESSION_SECONDS))
         log_event(db, 'login_ok', user['id'])
         public_user = {key: user[key] for key in ('id', 'email', 'name', 'role')}
-        return 200, {'user': public_user, 'categories': CATEGORIES, 'devices': DEVICES}, session_cookie(token, SESSION_SECONDS)
+        return 200, {'user': public_user, 'categories': CATEGORIES, 'devices': DEVICES,
+                     'csrfToken': csrf_token(token)}, session_cookie(token, SESSION_SECONDS)
 
     @staticmethod
     def require_editor(can_edit):
@@ -312,6 +354,7 @@ def create_server(port, database_path):
     initialize(database_path)
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     server.database_path = database_path
+    server.login_limiter = LoginLimiter()
     server.allowed_hosts = {f'{address}:{server.server_port}' for address in ('127.0.0.1', 'localhost')}
     return server
 
