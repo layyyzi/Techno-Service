@@ -7,8 +7,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
-from database import DEMO_PASSWORD, connect, initialize
-from server import Handler
+from database import DEMO_PASSWORD, connect, initialize, verify_password
+from server import Handler, LoginLimiter, https_origin, session_cookie
 
 
 class MemorySocket:
@@ -34,22 +34,30 @@ class KnowledgeBaseApiTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / 'test.sqlite3'
         initialize(self.path)
+        self.public_origin = ''
+        self.csrf_tokens = {}
+        self.login_limiter = LoginLimiter()
 
-    def http(self, method, path, body=None, cookie=None):
-        with self.response(method, path, body, cookie) as response:
+    def http(self, method, path, body=None, cookie=None, extra_headers=None):
+        with self.response(method, path, body, cookie, extra_headers) as response:
             raw = response.read()
             data = json.loads(raw) if response.headers.get_content_type() == 'application/json' else raw
             return response.status, data, response.getheader('Set-Cookie', '')
 
-    def response(self, method, path, body=None, cookie=None):
+    def response(self, method, path, body=None, cookie=None, extra_headers=None):
         payload = json.dumps(body).encode() if body is not None else b''
-        host = '127.0.0.1:8000'
+        host = self.public_origin.removeprefix('https://') if self.public_origin else '127.0.0.1:8000'
         headers = {'Host': host, 'Content-Type': 'application/json', 'Content-Length': len(payload)}
+        if method in ('POST', 'PATCH'):
+            headers['X-Techno-Request'] = '1'
+            headers['X-CSRF-Token'] = self.csrf_tokens.get(cookie, '')
         if cookie:
             headers['Cookie'] = cookie
+        headers.update(extra_headers or {})
         request = f'{method} {path} HTTP/1.1\r\n' + ''.join(f'{key}: {value}\r\n' for key, value in headers.items())
         stream = MemorySocket((request + '\r\n').encode() + payload)
-        settings = SimpleNamespace(database_path=self.path, allowed_hosts={host})
+        settings = SimpleNamespace(database_path=self.path, allowed_hosts={host},
+                                   login_limiter=self.login_limiter, public_origin=self.public_origin)
         QuietHandler(stream, ('127.0.0.1', 1025), settings)
         response = HTTPResponse(MemorySocket(stream.outgoing))
         response.begin()
@@ -59,7 +67,10 @@ class KnowledgeBaseApiTests(unittest.TestCase):
         status, data, cookie = self.http('POST', '/api/login', {'email': f'{role}@demo.test', 'password': DEMO_PASSWORD})
         self.assertEqual((status, data['user']['role']), (200, role))
         self.assertIn('HttpOnly', cookie)
-        return cookie.split(';', 1)[0]
+        cookie = cookie.split(';', 1)[0]
+        self.assertTrue(data['csrfToken'])
+        self.csrf_tokens[cookie] = data['csrfToken']
+        return cookie
 
     def test_login_logout_and_direct_document(self):
         status, page, _ = self.http('GET', '/instructions/1')
@@ -75,6 +86,73 @@ class KnowledgeBaseApiTests(unittest.TestCase):
         self.assertEqual(self.http('GET', '/api/articles/1', cookie=reader)[0], 200)
         self.assertEqual(self.http('POST', '/api/logout', {}, reader)[0], 200)
         self.assertEqual(self.http('GET', '/api/articles/1', cookie=reader)[0], 401)
+
+    def test_csrf_protection(self):
+        credentials = {'email': 'reader@demo.test', 'password': DEMO_PASSWORD}
+        self.assertEqual(self.http('POST', '/api/login', credentials,
+                                   extra_headers={'X-Techno-Request': ''})[0], 403)
+        editor = self.login('editor')
+        article = {'title': 'CSRF test', 'body': 'Test', 'category': 'Обладнання'}
+        for headers in ({'X-CSRF-Token': ''}, {'X-CSRF-Token': 'wrong'},
+                        {'Origin': 'https://other.example'}):
+            self.assertEqual(self.http('POST', '/api/articles', article, editor, headers)[0], 403)
+        reader = self.login('reader')
+        self.assertEqual(self.http('POST', '/api/articles', article, editor,
+                                   {'X-CSRF-Token': self.csrf_tokens[reader]})[0], 403)
+        status, session, _ = self.http('GET', '/api/session', cookie=editor)
+        self.assertEqual(status, 200)
+        self.assertEqual(session['csrfToken'], self.csrf_tokens[editor])
+        self.assertEqual(self.http('POST', '/api/articles', article, editor)[0], 201)
+
+    def test_login_rate_limit(self):
+        self.login_limiter = LoginLimiter(per_address=2)
+        credentials = {'email': 'reader@demo.test', 'password': 'wrong'}
+        for _ in range(2):
+            self.assertEqual(self.http('POST', '/api/login', credentials)[0], 401)
+        with self.response('POST', '/api/login', credentials) as response:
+            self.assertEqual(response.status, 429)
+            self.assertEqual(response.getheader('Retry-After'), '60')
+
+    def test_https_mode_cookies_and_origin(self):
+        self.public_origin = 'https://kb.example.com'
+        self.assertFalse(self.http('GET', '/api/config')[1]['demoAccounts'])
+        credentials = {'email': 'reader@demo.test', 'password': DEMO_PASSWORD}
+        self.assertEqual(self.http('POST', '/api/login', credentials)[0], 403)
+        status, session, cookie = self.http('POST', '/api/login', credentials,
+                                            extra_headers={'Origin': self.public_origin})
+        self.assertEqual(status, 200)
+        self.assertIn('; Secure', cookie)
+        self.assertIn('HttpOnly', cookie)
+        self.assertIn('SameSite=Strict', cookie)
+        cookie = cookie.split(';', 1)[0]
+        self.csrf_tokens[cookie] = session['csrfToken']
+        status, _, expired = self.http('POST', '/api/logout', {}, cookie, {'Origin': self.public_origin})
+        self.assertEqual(status, 200)
+        self.assertIn('; Secure', expired)
+        self.assertIn('Max-Age=0', expired)
+
+    def test_production_bootstrap(self):
+        production_path = self.path.with_name('production.sqlite3')
+        with self.assertRaises(ValueError):
+            initialize(production_path, production=True)
+        with self.assertRaises(ValueError):
+            initialize(self.path, production=True)
+        password = 'Unique-test-password-2026'
+        initialize(production_path, production=True, admin_email='admin@example.org', admin_password=password)
+        initialize(production_path, production=True)
+        with connect(production_path) as db:
+            users = db.execute('SELECT * FROM users').fetchall()
+            self.assertEqual(len(users), 1)
+            self.assertEqual((users[0]['email'], users[0]['role']), ('admin@example.org', 'admin'))
+            self.assertTrue(verify_password(password, users[0]))
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM articles').fetchone()[0], 0)
+
+    def test_public_origin_validation(self):
+        self.assertEqual(https_origin('https://kb.example.com:443/'), 'https://kb.example.com')
+        for value in ('http://kb.example.com', 'https://kb.example.com/path', 'https://user@kb.example.com'):
+            with self.assertRaises(ValueError):
+                https_origin(value)
+        self.assertNotIn('; Secure', session_cookie('token', 60))
 
     def test_brand_asset_is_available_before_login(self):
         with self.response('GET', '/brand.png') as response:

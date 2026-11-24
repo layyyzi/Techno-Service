@@ -1,15 +1,18 @@
 import argparse
 import hashlib
+import hmac
 import json
+import os
 import re
 import secrets
 import sqlite3
 import time
 import webbrowser
+from collections import deque
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from urllib.parse import parse_qs, urlsplit
 
 from database import CATEGORIES, DEVICES, ROLES, connect, initialize, log_event, save_version, verify_password
@@ -48,8 +51,49 @@ def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def session_cookie(token, max_age):
-    return f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}'
+def session_cookie(token, max_age, secure=False):
+    value = f'{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}'
+    return value + ('; Secure' if secure else '')
+
+
+def https_origin(value):
+    if not value:
+        return ''
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.path not in ('', '/')
+            or parsed.query or parsed.fragment
+            or not re.fullmatch(r'[a-zA-Z0-9.-]+', parsed.hostname)):
+        raise ValueError('TECHNO_PUBLIC_URL must be an HTTPS origin, e.g. https://kb.example.com')
+    port = parsed.port
+    return 'https://' + parsed.hostname + (f':{port}' if port not in (None, 443) else '')
+
+
+def csrf_token(token):
+    # Domain separation: never expose the stored session-token hash.
+    return hashlib.sha256(('csrf:' + token).encode()).hexdigest()
+
+
+class LoginLimiter:
+    """Bounded rolling window for a single server process."""
+    def __init__(self, window=60, per_address=10, total=120):
+        self.window = window
+        self.per_address = per_address
+        self.total = total
+        self.attempts = deque()
+        self.lock = Lock()
+
+    def allow(self, address):
+        now = time.monotonic()
+        with self.lock:
+            while self.attempts and self.attempts[0][0] <= now - self.window:
+                self.attempts.popleft()
+            if len(self.attempts) >= self.total:
+                return False
+            if sum(ip == address for _, ip in self.attempts) >= self.per_address:
+                return False
+            self.attempts.append((now, address))
+            return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -64,6 +108,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if self.server.public_origin:
+            self.send_header('Strict-Transport-Security', 'max-age=31536000')
+        if status == 429:
+            self.send_header('Retry-After', str(self.server.login_limiter.window))
         if cookie:
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
@@ -100,8 +148,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, 'Ця адреса недоступна.')
             if self.command in ('POST', 'PATCH'):
                 origin = self.headers.get('Origin')
-                if origin and origin != f'http://{host}':
+                expected_origin = self.server.public_origin or f'http://{host}'
+                if (self.server.public_origin and origin != expected_origin) or (origin and origin != expected_origin):
                     raise ApiError(403, 'Запит з іншого сайту відхилено.')
+                if self.headers.get('X-Techno-Request') != '1':
+                    raise ApiError(403, 'Запит не пройшов перевірку безпеки.')
             if self.command == 'GET' and (path in STATIC or re.fullmatch(r'/instructions/\d+', path)):
                 file, content_type = STATIC.get(path, STATIC['/'])
                 self.respond(200, (ROOT / 'public' / file).read_bytes(), content_type)
@@ -109,6 +160,9 @@ class Handler(BaseHTTPRequestHandler):
             if not path.startswith('/api/'):
                 raise ApiError(404, 'Сторінку не знайдено.')
             data = self.request_data() if self.command in ('POST', 'PATCH') else {}
+            if path == '/api/login' and self.command == 'POST':
+                if not self.server.login_limiter.allow(self.client_address[0]):
+                    raise ApiError(429, 'Забагато спроб входу. Спробуй через хвилину.')
             with connect(self.server.database_path) as db:
                 if self.command in ('POST', 'PATCH'):
                     db.execute('BEGIN IMMEDIATE')
@@ -127,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, db, path, query, data):
         method = self.command
         session = self.session_token()
+        if path == '/api/config' and method == 'GET':
+            return 200, {'demoAccounts': not bool(self.server.public_origin)}, None
         if path == '/api/login' and method == 'POST':
             return self.login(db, data, session)
 
@@ -135,13 +191,18 @@ class Handler(BaseHTTPRequestHandler):
                           (token_hash(session), int(time.time()))).fetchone()
         if not user:
             raise ApiError(401, 'Увійди, щоб отримати доступ.')
+        if method in ('POST', 'PATCH'):
+            supplied = self.headers.get('X-CSRF-Token', '')
+            if not hmac.compare_digest(supplied.encode(), csrf_token(session).encode()):
+                raise ApiError(403, 'Недійсний захисний токен. Онови сторінку.')
         can_edit = user['role'] in ('admin', 'editor')
 
         if path == '/api/logout' and method == 'POST':
             db.execute('DELETE FROM sessions WHERE token_hash = ?', (token_hash(session),))
-            return 200, {'ok': True}, session_cookie('', 0)
+            return 200, {'ok': True}, session_cookie('', 0, bool(self.server.public_origin))
         if path == '/api/session' and method == 'GET':
-            return 200, {'user': dict(user), 'categories': CATEGORIES, 'devices': DEVICES}, None
+            return 200, {'user': dict(user), 'categories': CATEGORIES, 'devices': DEVICES,
+                         'csrfToken': csrf_token(session)}, None
         if path == '/api/diagnose' and method == 'POST':
             device = data.get('device')
             if not isinstance(device, str) or device not in DEVICES:
@@ -198,8 +259,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.change_role(db, int(user_route[1]), user, data)
         raise ApiError(404, 'Ресурс не знайдено.')
 
-    @staticmethod
-    def login(db, data, old_token):
+    def login(self, db, data, old_token):
         email = required_text(data, 'email', 'Електронна пошта', 254).lower()
         password = required_text(data, 'password', 'Пароль', 128, trim=False)
         user = db.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
@@ -212,7 +272,8 @@ class Handler(BaseHTTPRequestHandler):
         db.execute('INSERT INTO sessions VALUES (?, ?, ?)', (token_hash(token), user['id'], now + SESSION_SECONDS))
         log_event(db, 'login_ok', user['id'])
         public_user = {key: user[key] for key in ('id', 'email', 'name', 'role')}
-        return 200, {'user': public_user, 'categories': CATEGORIES, 'devices': DEVICES}, session_cookie(token, SESSION_SECONDS)
+        return 200, {'user': public_user, 'categories': CATEGORIES, 'devices': DEVICES,
+                     'csrfToken': csrf_token(token)}, session_cookie(token, SESSION_SECONDS, bool(self.server.public_origin))
 
     @staticmethod
     def require_editor(can_edit):
@@ -308,22 +369,33 @@ class Handler(BaseHTTPRequestHandler):
         return 200, {'ok': True}, None
 
 
-def create_server(port, database_path):
-    initialize(database_path)
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+def create_server(port, database_path, bind='127.0.0.1', public_url='', admin_email='', admin_password=''):
+    origin = https_origin(public_url)
+    if bind not in ('127.0.0.1', '0.0.0.0'):
+        raise ValueError('TECHNO_BIND must be 127.0.0.1 or 0.0.0.0')
+    if bind != '127.0.0.1' and not origin:
+        raise ValueError('External binding requires TECHNO_PUBLIC_URL and an HTTPS reverse proxy')
+    initialize(database_path, production=bool(origin), admin_email=admin_email, admin_password=admin_password)
+    server = ThreadingHTTPServer((bind, port), Handler)
     server.database_path = database_path
-    server.allowed_hosts = {f'{address}:{server.server_port}' for address in ('127.0.0.1', 'localhost')}
+    server.login_limiter = LoginLimiter()
+    server.public_origin = origin
+    server.allowed_hosts = ({urlsplit(origin).netloc} if origin else
+                            {f'{address}:{server.server_port}' for address in ('127.0.0.1', 'localhost')})
     return server
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Локальна демоверсія бази знань')
-    parser.add_argument('--port', type=int, default=8000)
-    parser.add_argument('--db', type=Path, default=ROOT / 'data' / 'knowledge.sqlite3')
+    parser = argparse.ArgumentParser(description='ТехноСервіс — база знань')
+    parser.add_argument('--port', type=int, default=os.environ.get('PORT', '8000'))
+    parser.add_argument('--db', type=Path, default=os.environ.get('TECHNO_DB', ROOT / 'data' / 'knowledge.sqlite3'))
     parser.add_argument('--open', action='store_true', help='Відкрити демо у браузері')
     args = parser.parse_args()
-    with create_server(args.port, args.db) as server:
-        url = f'http://127.0.0.1:{server.server_port}'
+    with create_server(args.port, args.db, bind=os.environ.get('TECHNO_BIND', '127.0.0.1'),
+                       public_url=os.environ.get('TECHNO_PUBLIC_URL', ''),
+                       admin_email=os.environ.get('TECHNO_ADMIN_EMAIL', ''),
+                       admin_password=os.environ.get('TECHNO_ADMIN_PASSWORD', '')) as server:
+        url = server.public_origin or f'http://127.0.0.1:{server.server_port}'
         print(f'База знань працює: {url} (Ctrl+C — зупинити)', flush=True)
         if args.open:
             Thread(target=webbrowser.open, args=(url,), daemon=True).start()

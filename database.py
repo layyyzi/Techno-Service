@@ -105,7 +105,7 @@ def save_version(db, article_id, user_id):
                (user_id, article_id))
 
 
-def initialize(path):
+def initialize(path, production=False, admin_email='', admin_password=''):
     path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as db:
         db.execute('PRAGMA journal_mode = WAL')
@@ -116,7 +116,26 @@ def initialize(path):
             for field in ('device', 'model', 'symptoms'):
                 if field not in columns:
                     db.execute(f"ALTER TABLE {table} ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
-        if db.execute('SELECT id FROM users LIMIT 1').fetchone():
+        existing = db.execute('SELECT email, role FROM users').fetchall()
+        if production:
+            if existing:
+                if any(row['email'].lower().endswith('@demo.test') for row in existing):
+                    raise ValueError('Do not use the demo database in production; choose a new TECHNO_DB path')
+                if not any(row['role'] == 'admin' for row in existing):
+                    raise ValueError('Production database must contain an administrator')
+                return
+            email = admin_email.strip().lower()
+            if (not email or len(email) > 254 or email.count('@') != 1
+                    or not all(email.split('@')) or any(c.isspace() for c in email)
+                    or email.endswith('@demo.test')):
+                raise ValueError('Set TECHNO_ADMIN_EMAIL to a non-demo email')
+            if not 16 <= len(admin_password) <= 128 or admin_password == DEMO_PASSWORD:
+                raise ValueError('Set TECHNO_ADMIN_PASSWORD to a unique password of 16–128 characters')
+            salt = secrets.token_bytes(16)
+            db.execute('INSERT INTO users (email, name, role, salt, password_hash) VALUES (?, ?, ?, ?, ?)',
+                       (email, 'Адміністратор', 'admin', salt, hash_password(admin_password, salt)))
+            return
+        if existing:
             return
         for role, name in zip(ROLES, ('Адміністратор', 'Редактор', 'Читач')):
             salt = secrets.token_bytes(16)

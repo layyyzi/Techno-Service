@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    environment:
+      TECHNO_PUBLIC_URL: "https://${TECHNO_DOMAIN:?Set TECHNO_DOMAIN}"
+      TECHNO_ADMIN_EMAIL: "${TECHNO_ADMIN_EMAIL:?Set TECHNO_ADMIN_EMAIL}"
+      TECHNO_ADMIN_PASSWORD: "${TECHNO_ADMIN_PASSWORD:?Set TECHNO_ADMIN_PASSWORD}"
+    volumes:
+      - knowledge_data:/app/data
+    restart: unless-stopped
+  proxy:
+    image: caddy:2
+    environment:
+      TECHNO_DOMAIN: "${TECHNO_DOMAIN:?Set TECHNO_DOMAIN}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+volumes:
+  knowledge_data:
+  caddy_data:
+  caddy_config:
