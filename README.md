@@ -46,7 +46,7 @@ cd Techno-Service
 python server.py --open
 ```
 
-Для перевірки поточної гілки розробки перед запуском виконай `git switch feature/cloud-security`. Якщо у Windows Python доступний через `py`, використовуй `py -3 server.py --open`. Якщо вже маєш локальний Python у .runtime, можна запустити `..runtime\python\python.exe server.py --open`. Також доступний start-demo.cmd.
+Для перевірки поточної гілки розробки перед запуском виконай `git switch feature/cloud-security`. Якщо у Windows Python доступний через `py`, використовуй `py -3 server.py --open`. Якщо вже маєш локальний Python у .runtime, можна запустити `.\.runtime\python\python.exe server.py --open`. Також доступний start-demo.cmd.
 
 Адреса: http://127.0.0.1:8000. Зупинка: Ctrl+C. Інший порт: `python server.py --port 8080 --open`.
 
@@ -66,7 +66,7 @@ python build_public_demo.py
 node --test test_public_demo.mjs
 ```
 
-На Windows з локальним Python заміни python на `..runtime\python\python.exe`. Публічне демо збирається в dist. [GitHub Actions](https://github.com/layyyzi/Techno-Service/actions).
+На Windows з локальним Python заміни python на `.\.runtime\python\python.exe`. Публічне демо збирається в dist. [GitHub Actions](https://github.com/layyyzi/Techno-Service/actions).
 
 ## Документація
 
