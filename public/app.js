@@ -27,6 +27,7 @@ const articleHref = id => (publicDemo ? '#' : '') + '/instructions/' + id;
 const dialog = document.querySelector('#dialog');
 const notice = document.querySelector('#notice');
 let currentUser = null;
+let csrfToken = '';
 let categories = [];
 let devices = {};
 let diagnosticDraft = {device: 'printer', model: '', symptom: ''};
@@ -62,7 +63,7 @@ async function request(path, method = 'GET', data = {}) {
   if (publicDemo) return globalThis.TechnoDemo.request(path, method, data);
   const options = method === 'GET' ? {} : {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Techno-Request': '1', 'X-CSRF-Token': csrfToken },
     body: JSON.stringify(data),
   };
   let response;
@@ -128,6 +129,7 @@ function renderLogin() {
 
 function setSession(session) {
   currentUser = session.user;
+  csrfToken = session.csrfToken || '';
   categories = session.categories;
   devices = session.devices || {};
 }
