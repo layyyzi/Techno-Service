@@ -22,6 +22,7 @@ const categoryStyles = {
 };
 const app = document.querySelector('#app');
 const publicDemo = Boolean(globalThis.TechnoDemo);
+let demoAccounts = publicDemo;
 const currentPath = () => publicDemo ? (location.hash.slice(1) || '/') : location.pathname;
 const articleHref = id => (publicDemo ? '#' : '') + '/instructions/' + id;
 const dialog = document.querySelector('#dialog');
@@ -103,15 +104,15 @@ function renderLogin() {
   app.innerHTML =
     '<main class="login"><section class="login-side">' + brand +
     '<div><h1>Корпоративна база знань</h1><p>Технічні інструкції для щоденної роботи з обладнанням, мережею та програмами.</p></div>' +
-    '<small>' + (publicDemo ? 'Публічне демо · зміни зберігаються у твоєму браузері' : 'Локальна демонстрація кваліфікаційної роботи') + '</small></section>' +
+    '<small>' + (publicDemo ? 'Публічне демо · зміни зберігаються у твоєму браузері' : (demoAccounts ? 'Локальна демонстрація кваліфікаційної роботи' : 'Корпоративна база знань')) + '</small></section>' +
     '<section class="login-main"><div class="login-card"><h2>Вхід до бази знань</h2>' +
     '<p class="muted">Увійди під обліковим записом працівника.</p>' +
-    '<form class="fields" id="login-form"><label class="field">Електронна пошта<input name="email" type="email" autocomplete="username" placeholder="editor@demo.test" maxlength="254" required></label>' +
+    '<form class="fields" id="login-form"><label class="field">Електронна пошта<input name="email" type="email" autocomplete="username" placeholder="' + (demoAccounts ? 'editor@demo.test' : 'name@company.example') + '" maxlength="254" required></label>' +
     '<label class="field">Пароль<input name="password" type="password" autocomplete="current-password" maxlength="128" required></label>' +
     '<p class="error" role="alert" hidden></p><button class="button primary" type="submit">Увійти</button></form>' +
-    '<div class="login-demo"><p>Заповнити форму демонстраційними даними</p><div class="row">' +
+    (demoAccounts ? '<div class="login-demo"><p>Заповнити форму демонстраційними даними</p><div class="row">' +
     Object.entries(roles).map(([role, name]) => '<button class="button" data-demo="' + role + '">' + name + '</button>').join('') +
-    '</div></div></div></section></main>';
+    '</div></div>' : '') + '</div></section></main>';
   const form = app.querySelector('form');
   app.querySelectorAll('[data-demo]').forEach(button => button.addEventListener('click', () => {
     form.elements.email.value = button.dataset.demo + '@demo.test';
@@ -572,6 +573,7 @@ window.addEventListener('popstate', () => {
 
 async function start() {
   try {
+    if (!publicDemo) demoAccounts = Boolean((await request('/config')).demoAccounts);
     setSession(await request('/session'));
     await renderLocation();
   } catch (error) {
